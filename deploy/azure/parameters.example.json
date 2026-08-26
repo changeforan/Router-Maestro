@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "japaneast"
+    },
+    "appName": {
+      "value": "router-maestro"
+    },
+    "environmentName": {
+      "value": "router-maestro-env"
+    },
+    "storageAccountName": {
+      "value": "rmstate<REPLACE_WITH_UNIQUE_SUFFIX>"
+    },
+    "fileShareName": {
+      "value": "rmstate"
+    },
+    "image": {
+      "value": "likanwen/router-maestro:0.7.10"
+    },
+    "logLevel": {
+      "value": "INFO"
+    },
+    "fileShareQuotaGiB": {
+      "value": 1
+    }
+  }
+}
