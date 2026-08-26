@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,7 +68,33 @@ class ToolCall:
     arguments_json: str
 
 
-ContentPart = Text | Reasoning | ToolCall
+@dataclass(frozen=True, slots=True)
+class ServerToolUse:
+    """A tool Router-Maestro executed itself, replayed for the client.
+
+    Mirrors Anthropic's hosted server-tool shape so clients can render the
+    search that happened, even though it ran here rather than upstream.
+    """
+
+    tool_id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ServerToolResult:
+    """The result of a locally-executed server tool.
+
+    ``encrypted_content`` is deliberately absent: Anthropic signs that blob and
+    it cannot be forged. Clients use these blocks to render sources, not to
+    replay them upstream.
+    """
+
+    tool_use_id: str
+    sources: list[tuple[str, str]]  # (title, url)
+
+
+ContentPart = Text | Reasoning | ToolCall | ServerToolUse | ServerToolResult
 
 
 def _validate_canonical_scalars(value: ChatResponse | ChatStreamChunk) -> None:
@@ -163,6 +190,22 @@ def _block_dict(part: ContentPart, *, streaming: bool = False) -> dict[str, Any]
         return block
     if isinstance(part, Text):
         return {"type": "text", "text": "" if streaming else part.text}
+    if isinstance(part, ServerToolUse):
+        return {
+            "type": "server_tool_use",
+            "id": part.tool_id,
+            "name": part.name,
+            "input": {} if streaming else part.input,
+        }
+    if isinstance(part, ServerToolResult):
+        return {
+            "type": "web_search_tool_result",
+            "tool_use_id": part.tool_use_id,
+            "content": [
+                {"type": "web_search_result", "title": title, "url": url}
+                for title, url in part.sources
+            ],
+        }
     return {
         "type": "tool_use",
         "id": part.tool_id,
@@ -177,7 +220,36 @@ def _schema_block(part: ContentPart) -> AnthropicAssistantContentBlock:
         return AnthropicThinkingBlock(**data)
     if isinstance(part, Text):
         return AnthropicTextBlock(**data)
+    if isinstance(part, ServerToolUse | ServerToolResult):
+        # AnthropicAssistantContentBlock permits a raw dict, so these need no
+        # dedicated Pydantic model.
+        return data
     return AnthropicToolUseBlock(**data)
+
+
+# Anthropic's wire name for the hosted search tool. Protocol-level knowledge, so
+# it lives here rather than being imported from the tool implementation.
+WEB_SEARCH_BLOCK_NAME = "web_search"
+
+
+def server_tool_parts(records: Sequence[Any]) -> list[ContentPart]:
+    """Turn executed local-tool records into replayable content parts."""
+    parts: list[ContentPart] = []
+    for record in records:
+        parts.append(
+            ServerToolUse(
+                tool_id=record.tool_id,
+                name=WEB_SEARCH_BLOCK_NAME,
+                input={"query": record.query},
+            )
+        )
+        parts.append(
+            ServerToolResult(
+                tool_use_id=record.tool_id,
+                sources=[(c.title, c.url) for c in record.citations],
+            )
+        )
+    return parts
 
 
 def build_anthropic_response(
@@ -185,22 +257,37 @@ def build_anthropic_response(
     *,
     response_id: str,
     model: str,
+    server_tool_parts_: Sequence[ContentPart] | None = None,
+    server_tool_requests: int = 0,
 ) -> AnthropicMessagesResponse:
-    """Build one non-stream response through the shared content rules."""
+    """Build one non-stream response through the shared content rules.
+
+    ``server_tool_parts_`` are inserted ahead of the model's text so the client
+    sees the search that produced it, matching Anthropic's native ordering.
+    """
     _validate_canonical_scalars(response)
     usage = _validated_usage(response.usage)
+    parts = _response_parts(response)
+    if server_tool_parts_:
+        # Native ordering is: thinking, then the server-tool exchange, then the
+        # answer text. Reasoning stays first if present.
+        lead = 1 if parts and isinstance(parts[0], Reasoning) else 0
+        parts = [*parts[:lead], *server_tool_parts_, *parts[lead:]]
+    anthropic_usage = AnthropicUsage(
+        input_tokens=usage.get("prompt_tokens", 0),
+        output_tokens=usage.get("completion_tokens", 0),
+    )
+    if server_tool_requests:
+        anthropic_usage.server_tool_use = {"web_search_requests": server_tool_requests}
     return AnthropicMessagesResponse(
         id=response_id,
         type="message",
         role="assistant",
-        content=[_schema_block(part) for part in _response_parts(response)],
+        content=[_schema_block(part) for part in parts],
         model=model,
         stop_reason=_anthropic_stop_reason(response.finish_reason),
         stop_sequence=None,
-        usage=AnthropicUsage(
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
-        ),
+        usage=anthropic_usage,
     )
 
 
@@ -214,10 +301,16 @@ class AnthropicReducer:
         model: str,
         estimated_input_tokens: int = 0,
         state: AnthropicStreamState | None = None,
+        local_tool_names: set[str] | None = None,
     ) -> None:
         self.response_id = response_id
         self.model = model
         self.state = state or AnthropicStreamState(estimated_input_tokens=estimated_input_tokens)
+        # Tools Router-Maestro executes itself. When a turn terminates with only
+        # these, the downstream message is suspended rather than completed so the
+        # caller can run the tool and continue the same message with a new turn.
+        self.local_tool_names = local_tool_names or set()
+        self.pending_local_tool_calls: list[dict[str, Any]] = []
 
     def start(self) -> list[Event]:
         """Emit the idempotent downstream message_start event."""
@@ -245,7 +338,7 @@ class AnthropicReducer:
                         "output_tokens": 1,
                         "cache_creation_input_tokens": None,
                         "cache_read_input_tokens": None,
-                        "server_tool_use": None,
+                        "server_tool_use": self._server_tool_usage(),
                         "service_tier": "standard",
                     },
                 },
@@ -373,6 +466,51 @@ class AnthropicReducer:
         if advance:
             self.state.content_block_index += 1
 
+    def emit_server_tool_parts(self, parts: Sequence[ContentPart]) -> list[Event]:
+        """Emit locally-executed server-tool blocks into the open message.
+
+        Called between upstream turns, after the reducer suspended and the tool
+        actually ran, so the blocks land in native order: any preamble text, then
+        the tool exchange, then the answer.
+        """
+        events: list[Event] = []
+        for part in parts:
+            index = self.state.content_block_index
+            if isinstance(part, ServerToolUse):
+                events.extend(
+                    [
+                        {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": _block_dict(part, streaming=True),
+                        },
+                        {
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(part.input),
+                            },
+                        },
+                        {"type": "content_block_stop", "index": index},
+                    ]
+                )
+                self.state.server_tool_requests += 1
+            else:
+                # Results carry no incremental payload; start and stop is enough.
+                events.extend(
+                    [
+                        {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": _block_dict(part),
+                        },
+                        {"type": "content_block_stop", "index": index},
+                    ]
+                )
+            self.state.content_block_index += 1
+        return events
+
     def _emit_terminal(
         self,
         events: list[Event],
@@ -380,6 +518,34 @@ class AnthropicReducer:
         finish_reason: str,
     ) -> None:
         tool_calls = self._validated_tool_calls()
+
+        # Router-Maestro-local tools (e.g. web_search) never reach the client.
+        # Suspend the downstream message instead of terminating it: close any
+        # open block, stash the calls for the caller to execute, and leave
+        # ``message_complete`` unset so the next upstream turn continues this
+        # same message with monotonically increasing block indices.
+        #
+        # A turn may mix local and client-side calls (Claude issues parallel tool
+        # calls freely). Suspending on *any* local call is deliberate: the client
+        # declared the local tool as a hosted server tool and cannot execute it,
+        # so emitting it downstream would stall the conversation. Client-side
+        # calls made in the same turn are dropped here and re-issued by the model
+        # on the next turn, when it also has the tool results.
+        local_calls = [call for call in tool_calls if call.name in self.local_tool_names]
+        if local_calls:
+            self._close_open_block(events, advance=True)
+            self.pending_local_tool_calls = [
+                {
+                    "id": call.tool_id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments_json},
+                }
+                for call in local_calls
+            ]
+            self.state.tool_calls = []
+            self.state.next_tool_arrival_ordinal = 0
+            return
+
         self._close_open_block(events, advance=bool(tool_calls))
 
         for tool_call in tool_calls:
@@ -423,13 +589,19 @@ class AnthropicReducer:
                         "output_tokens": completion_tokens,
                         "cache_creation_input_tokens": 0,
                         "cache_read_input_tokens": 0,
-                        "server_tool_use": None,
+                        "server_tool_use": self._server_tool_usage(),
                     },
                 },
                 {"type": "message_stop"},
             ]
         )
         self.state.message_complete = True
+
+    def _server_tool_usage(self) -> dict[str, int] | None:
+        """Report server-tool counters once Router-Maestro has run one."""
+        if not self.state.server_tool_requests:
+            return None
+        return {"web_search_requests": self.state.server_tool_requests}
 
     def _accumulate_tool_call(self, tool_call: dict[str, Any]) -> None:
         if not isinstance(tool_call, dict):

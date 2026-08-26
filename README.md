@@ -56,6 +56,15 @@ Router-Maestro acts as a proxy that gives you access to models from multiple pro
   the highest advertised tier that does not exceed the request. It never
   silently raises reasoning effort, cost, or latency; a request with no valid
   lower tier is rejected.
+- **Server-side `web_search`**: GitHub Copilot's model endpoints reject
+  Anthropic's hosted `web_search` server tool ("The use of the web search tool
+  is not supported"), because Copilot's own web search is an MCP tool run by the
+  client, not an API capability. When enabled, Router-Maestro plays that client
+  role itself: it advertises `web_search` as a function tool, intercepts the
+  model's `tool_use`, runs the search, feeds the result back, and returns only
+  the final answer. The default backend reuses the stored GitHub Copilot
+  credential (no extra API key); a Google Programmable Search backend is also
+  available. Disabled by default — see [docs/web-search.md](docs/web-search.md).
 
 ## Table of Contents
 

@@ -36,6 +36,7 @@ from router_maestro.server.protocols.anthropic_reducer import (
     AnthropicReducer,
     AnthropicStreamProtocolError,
     build_anthropic_response,
+    server_tool_parts,
 )
 from router_maestro.server.protocols.errors import postcommit_error_data, protocol_error_response
 from router_maestro.server.routes._outcomes import record_chat_response_outcome
@@ -50,6 +51,16 @@ from router_maestro.server.schemas.anthropic import (
 )
 from router_maestro.server.streaming import sse_streaming_response
 from router_maestro.server.translation import translate_anthropic_to_openai
+from router_maestro.server.web_search_runtime import (
+    WebSearchSession,
+    execute_web_search_calls,
+    extend_request,
+    merge_usage,
+    pending_web_search_calls,
+    prepare_web_search,
+    strip_local_tool_calls,
+)
+from router_maestro.tools.web_search import WEB_SEARCH_TOOL_NAME
 from router_maestro.utils import count_anthropic_request_tokens, get_logger
 from router_maestro.utils.async_iterators import close_async_iterator
 from router_maestro.utils.context_window import resolve_thinking_budget
@@ -322,6 +333,73 @@ def _mid_conv_system_rejection_response() -> JSONResponse:
     )
 
 
+def _without_tool(tools: list[dict] | None, name: str) -> list[dict] | None:
+    """Return ``tools`` with the named function tool removed."""
+    if not tools:
+        return tools
+    remaining = [t for t in tools if (t.get("function") or {}).get("name") != name]
+    return remaining or None
+
+
+async def _run_web_search_loop(
+    model_router: Router,
+    chat_request: ChatRequest,
+    response,
+    provider_name: str,
+    session: WebSearchSession,
+):
+    """Execute local web_search calls until the model produces a final answer.
+
+    Each iteration runs the searches the model asked for, appends the results as
+    ``tool`` messages, and re-issues the request upstream. The client never sees
+    these turns — only the final response is returned.
+
+    The follow-up calls deliberately omit ``prepared_plan``: the prepared plan is
+    bound to the original request and ``PreparedChatCompletion.matches()`` would
+    reject the extended message list.
+    """
+    usage = response.usage
+    # Bounded: every iteration either spends budget or withdraws the tool, so the
+    # loop cannot outlive the budget. The cap is a belt-and-braces guard against a
+    # model that keeps calling a tool it is no longer offered.
+    for _ in range(session.max_uses + 2):
+        calls = pending_web_search_calls(response)
+        if not calls:
+            break
+
+        tool_messages = await execute_web_search_calls(session, calls)
+        # Only the locally-executed calls go back upstream. A turn may also carry
+        # client-side tool calls; sending those without a matching tool_result
+        # would be rejected by OpenAI-compatible upstreams, so they are dropped
+        # and the model re-issues them next turn, when it has the results too.
+        chat_request = extend_request(
+            chat_request,
+            assistant_content=response.content,
+            tool_calls=calls,
+            tool_messages=tool_messages,
+        )
+
+        if session.exhausted:
+            # Budget spent: withdraw the tool so the model answers with what it
+            # has instead of looping. Mirrors the streaming path.
+            logger.info(
+                "web_search budget exhausted (%d uses); withdrawing the tool",
+                session.used,
+            )
+            chat_request = replace(
+                chat_request,
+                tools=_without_tool(chat_request.tools, WEB_SEARCH_TOOL_NAME),
+            )
+
+        response, provider_name = await model_router.chat_completion(chat_request)
+        usage = merge_usage(usage, response.usage)
+
+    logger.info("Local web_search loop finished after %d search(es)", session.used)
+    # Safety net: a locally-served tool call must never reach the client, which
+    # declared it as a hosted server tool and has no implementation for it.
+    return strip_local_tool_calls(replace(response, usage=usage)), provider_name
+
+
 @router.post("/v1/messages")
 @router.post("/api/anthropic/v1/messages")
 async def messages(request: AnthropicMessagesRequest, raw_request: FastAPIRequest):
@@ -369,6 +447,11 @@ async def messages(request: AnthropicMessagesRequest, raw_request: FastAPIReques
 
     model_router = get_router()
 
+    # Swap Anthropic's hosted web_search server tool (which most upstreams
+    # cannot execute) for a locally-executed function tool. Returns None when
+    # the client did not request it or the feature is disabled.
+    web_search_session = prepare_web_search(request)
+
     # Translate Anthropic request to OpenAI format
     chat_request = translate_anthropic_to_openai(request)
 
@@ -405,6 +488,7 @@ async def messages(request: AnthropicMessagesRequest, raw_request: FastAPIReques
                 request.model,
                 token_estimation_request=request,
                 prepared_plan=prepared_plan,
+                web_search_session=web_search_session,
             ),
             keepalive_frame=ANTHROPIC_PING_FRAME,
         )
@@ -414,15 +498,31 @@ async def messages(request: AnthropicMessagesRequest, raw_request: FastAPIReques
             chat_request,
             prepared_plan=prepared_plan,
         )
+        if web_search_session is not None:
+            response, provider_name = await _run_web_search_loop(
+                model_router,
+                chat_request,
+                response,
+                provider_name,
+                web_search_session,
+            )
         response_model = (
             response.selected_model.qualified_id
             if response.selected_model is not None
             else qualify_model_id(provider_name, response.model)
         )
+        native_parts = None
+        server_tool_requests = 0
+        if web_search_session is not None and web_search_session.records:
+            server_tool_requests = web_search_session.used
+            if web_search_session.emit_native_blocks:
+                native_parts = server_tool_parts(web_search_session.records)
         downstream_response = build_anthropic_response(
             response,
             response_id=f"msg_{uuid.uuid4().hex[:24]}",
             model=response_model,
+            server_tool_parts_=native_parts,
+            server_tool_requests=server_tool_requests,
         )
         record_chat_response_outcome(response)
 
@@ -548,8 +648,16 @@ async def stream_response(
     *,
     token_estimation_request: AnthropicMessagesRequest | None = None,
     prepared_plan=None,
+    web_search_session: WebSearchSession | None = None,
 ) -> AsyncGenerator[str]:
-    """Stream Anthropic Messages API response."""
+    """Stream Anthropic Messages API response.
+
+    When ``web_search_session`` is set, upstream turns that end by calling the
+    Router-Maestro-local ``web_search`` tool do not terminate the downstream
+    message. The tool runs here, its result is appended, and another upstream
+    turn continues the same SSE message — the client sees one uninterrupted
+    response and never observes the tool traffic.
+    """
     response_id = f"msg_{uuid.uuid4().hex[:24]}"
     reducer: AnthropicReducer | None = None
 
@@ -562,36 +670,11 @@ async def stream_response(
     pipeline = None
     stream = None
     terminal_outcome: TerminalOutcome | None = None
+    local_tool_names = {WEB_SEARCH_TOOL_NAME} if web_search_session is not None else set()
+    # Shared across upstream turns so content block indices stay monotonic and
+    # ``message_start`` is emitted exactly once.
+    stream_state = None
     try:
-        if prepared_plan is None:
-            stream, provider_name = await model_router.chat_completion_stream(request)
-        else:
-            stream, provider_name = await model_router.chat_completion_stream(
-                request,
-                prepared_plan=prepared_plan,
-            )
-        selected_model = getattr(stream, "selected_model", None)
-        if token_estimation_request is not None:
-            selected_provider = (
-                selected_model.provider if selected_model is not None else provider_name
-            )
-            estimated_input_tokens = _estimate_input_tokens(
-                token_estimation_request,
-                selected_provider,
-            )
-        response_model = (
-            selected_model.qualified_id
-            if selected_model is not None
-            else qualify_model_id(provider_name, original_model)
-        )
-        reducer = AnthropicReducer(
-            response_id=response_id,
-            model=response_model,
-            estimated_input_tokens=estimated_input_tokens,
-        )
-        for start_event in reducer.start():
-            yield f"event: {start_event['type']}\ndata: {json.dumps(start_event)}\n\n"
-
         # Track state needed to recover tool calls that the upstream model
         # leaked as <invoke> XML *text* instead of structured tool_calls (a
         # github-copilot/claude-* quirk under long contexts). Without recovery
@@ -605,9 +688,9 @@ async def stream_response(
                 for t in request.tools
                 if (t.get("function") or {}).get("name")
             } or None
-        saw_real_tool_call = False
 
-        # Unified pipeline: guards + audit in one object
+        # Unified pipeline: guards + audit in one object. Created once per
+        # client request; it spans every internal upstream turn.
         from router_maestro.pipeline import RequestPipeline
 
         pipeline = RequestPipeline.create(
@@ -616,126 +699,243 @@ async def stream_response(
             tool_names=allowed_tool_names,
         )
 
-        async for chunk in stream:
-            # Feed through guards (leak detection + runaway)
-            abort_reason = pipeline.feed_stream(chunk)
-            if abort_reason:
-                terminal_outcome = exception_outcome(abort_reason, code="overloaded")
-                logger.warning("Stream aborted: %s", abort_reason)
-                yield _sse_error_event(
-                    ProviderError(
-                        "Overloaded: please retry this request",
-                        status_code=529,
-                        kind=ProviderFailureKind.RATE_LIMIT,
-                    )
+        first_turn = True
+        # Bounded: each extra turn costs one unit of the web_search budget, and the
+        # tool is withdrawn once that is spent. The cap is a belt-and-braces guard.
+        max_turns = (web_search_session.max_uses + 2) if web_search_session is not None else 1
+        for _turn in range(max_turns):
+            if prepared_plan is None:
+                stream, provider_name = await model_router.chat_completion_stream(request)
+            else:
+                stream, provider_name = await model_router.chat_completion_stream(
+                    request,
+                    prepared_plan=prepared_plan,
                 )
-                pipeline.finish(
-                    wire_status=200,
-                    outcome=terminal_outcome,
-                    body_summary=abort_reason,
+            selected_model = getattr(stream, "selected_model", None)
+            if first_turn and token_estimation_request is not None:
+                selected_provider = (
+                    selected_model.provider if selected_model is not None else provider_name
                 )
-                return
-
-            if chunk.tool_calls:
-                saw_real_tool_call = True
-
-            chunk_outcome = resolve_terminal_outcome(
-                chunk.terminal_outcome,
-                chunk.finish_reason,
+                estimated_input_tokens = _estimate_input_tokens(
+                    token_estimation_request,
+                    selected_provider,
+                )
+            response_model = (
+                selected_model.qualified_id
+                if selected_model is not None
+                else qualify_model_id(provider_name, original_model)
             )
-            if chunk_outcome is not None:
-                terminal_outcome = chunk_outcome
-            recovered_tool_calls = chunk.tool_calls
-            finish_reason = (
-                finish_reason_for_outcome(chunk_outcome)
-                if chunk_outcome is not None
-                else chunk.finish_reason
+            reducer = AnthropicReducer(
+                response_id=response_id,
+                model=response_model,
+                estimated_input_tokens=estimated_input_tokens,
+                state=stream_state,
+                local_tool_names=local_tool_names,
             )
-            if finish_reason and not saw_real_tool_call:
-                leaked = pipeline.check_invoke_at_finish()
-                if leaked:
-                    recovered_tool_calls = leaked
-                    finish_reason = "tool_calls"
-                    if (
-                        chunk_outcome is not None
-                        and chunk_outcome.response_status is ResponseStatus.COMPLETED
-                    ):
-                        chunk_outcome = replace(
-                            chunk_outcome,
-                            finish_reason="tool_calls",
+            stream_state = reducer.state
+            for start_event in reducer.start():
+                yield f"event: {start_event['type']}\ndata: {json.dumps(start_event)}\n\n"
+
+            saw_real_tool_call = False
+            suspended_for_local_tools = False
+            # Text the model streamed this turn. Already delivered downstream, but
+            # it must also go back upstream on the next turn or the model has no
+            # record of it and repeats an equivalent preamble.
+            turn_text: list[str] = []
+
+            async for chunk in stream:
+                # Feed through guards (leak detection + runaway)
+                abort_reason = pipeline.feed_stream(chunk)
+                if abort_reason:
+                    terminal_outcome = exception_outcome(abort_reason, code="overloaded")
+                    logger.warning("Stream aborted: %s", abort_reason)
+                    yield _sse_error_event(
+                        ProviderError(
+                            "Overloaded: please retry this request",
+                            status_code=529,
+                            kind=ProviderFailureKind.RATE_LIMIT,
                         )
-                        terminal_outcome = chunk_outcome
-
-            if chunk_outcome is not None and chunk_outcome.response_status not in {
-                ResponseStatus.COMPLETED,
-                ResponseStatus.INCOMPLETE,
-            }:
-                error = chunk_outcome.error
-                message = error.message if error is not None else "Upstream response failed"
-                yield _sse_error_event(
-                    ProviderError(message, status_code=502, kind=ProviderFailureKind.UNKNOWN)
-                )
-                pipeline.finish(
-                    wire_status=200,
-                    outcome=chunk_outcome,
-                    body_summary=message,
-                )
-                return
-
-            try:
-                events = reducer.reduce(
-                    ChatStreamChunk(
-                        content=chunk.content,
-                        refusal=chunk.refusal,
-                        finish_reason=finish_reason,
-                        usage=chunk.usage,
-                        tool_calls=recovered_tool_calls,
-                        thinking=chunk.thinking,
-                        thinking_signature=chunk.thinking_signature,
-                        thinking_id=chunk.thinking_id,
-                        terminal_outcome=chunk_outcome,
                     )
+                    pipeline.finish(
+                        wire_status=200,
+                        outcome=terminal_outcome,
+                        body_summary=abort_reason,
+                    )
+                    return
+
+                if chunk.tool_calls:
+                    saw_real_tool_call = True
+                if chunk.content:
+                    turn_text.append(chunk.content)
+
+                chunk_outcome = resolve_terminal_outcome(
+                    chunk.terminal_outcome,
+                    chunk.finish_reason,
                 )
-            except AnthropicStreamProtocolError:
-                terminal_outcome = exception_outcome(
-                    "Invalid tool call from upstream",
-                    code="upstream_protocol_error",
+                if chunk_outcome is not None:
+                    terminal_outcome = chunk_outcome
+                recovered_tool_calls = chunk.tool_calls
+                finish_reason = (
+                    finish_reason_for_outcome(chunk_outcome)
+                    if chunk_outcome is not None
+                    else chunk.finish_reason
                 )
-                logger.warning("Invalid Anthropic tool stream from upstream", exc_info=True)
-                yield _sse_error_event(
-                    ProviderError(
+                if finish_reason and not saw_real_tool_call:
+                    leaked = pipeline.check_invoke_at_finish()
+                    if leaked:
+                        recovered_tool_calls = leaked
+                        finish_reason = "tool_calls"
+                        if (
+                            chunk_outcome is not None
+                            and chunk_outcome.response_status is ResponseStatus.COMPLETED
+                        ):
+                            chunk_outcome = replace(
+                                chunk_outcome,
+                                finish_reason="tool_calls",
+                            )
+                            terminal_outcome = chunk_outcome
+
+                if chunk_outcome is not None and chunk_outcome.response_status not in {
+                    ResponseStatus.COMPLETED,
+                    ResponseStatus.INCOMPLETE,
+                }:
+                    error = chunk_outcome.error
+                    message = error.message if error is not None else "Upstream response failed"
+                    yield _sse_error_event(
+                        ProviderError(message, status_code=502, kind=ProviderFailureKind.UNKNOWN)
+                    )
+                    pipeline.finish(
+                        wire_status=200,
+                        outcome=chunk_outcome,
+                        body_summary=message,
+                    )
+                    return
+
+                try:
+                    events = reducer.reduce(
+                        ChatStreamChunk(
+                            content=chunk.content,
+                            refusal=chunk.refusal,
+                            finish_reason=finish_reason,
+                            usage=chunk.usage,
+                            tool_calls=recovered_tool_calls,
+                            thinking=chunk.thinking,
+                            thinking_signature=chunk.thinking_signature,
+                            thinking_id=chunk.thinking_id,
+                            terminal_outcome=chunk_outcome,
+                        )
+                    )
+                except AnthropicStreamProtocolError:
+                    terminal_outcome = exception_outcome(
                         "Invalid tool call from upstream",
-                        status_code=502,
-                        kind=ProviderFailureKind.UPSTREAM_PROTOCOL,
+                        code="upstream_protocol_error",
                     )
+                    logger.warning("Invalid Anthropic tool stream from upstream", exc_info=True)
+                    yield _sse_error_event(
+                        ProviderError(
+                            "Invalid tool call from upstream",
+                            status_code=502,
+                            kind=ProviderFailureKind.UPSTREAM_PROTOCOL,
+                        )
+                    )
+                    pipeline.finish(
+                        wire_status=200,
+                        outcome=terminal_outcome,
+                        body_summary="Invalid tool call from upstream",
+                    )
+                    return
+
+                for event in events:
+                    yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+
+                if chunk_outcome is not None:
+                    # The reducer suspends instead of terminating when the turn
+                    # ended by calling a Router-Maestro-local tool.
+                    if reducer.pending_local_tool_calls:
+                        suspended_for_local_tools = True
+                        break
+                    pipeline.finish(wire_status=200, outcome=chunk_outcome)
+                    return
+
+            if suspended_for_local_tools and web_search_session is not None:
+                pending_calls = reducer.pending_local_tool_calls
+                reducer.pending_local_tool_calls = []
+                await close_async_iterator(stream)
+                stream = None
+
+                records_before = len(web_search_session.records)
+                tool_messages = await execute_web_search_calls(web_search_session, pending_calls)
+
+                # Replay the searches we just ran as native blocks, in the same
+                # position Anthropic would put them: after any preamble text and
+                # before the answer produced by the next turn.
+                new_records = web_search_session.records[records_before:]
+                if new_records:
+                    if web_search_session.emit_native_blocks:
+                        for event in reducer.emit_server_tool_parts(server_tool_parts(new_records)):
+                            yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                    else:
+                        # Still count them so usage stays truthful.
+                        stream_state.server_tool_requests += len(new_records)
+
+                request = extend_request(
+                    request,
+                    assistant_content="".join(turn_text),
+                    tool_calls=pending_calls,
+                    tool_messages=tool_messages,
                 )
-                pipeline.finish(
-                    wire_status=200,
-                    outcome=terminal_outcome,
-                    body_summary="Invalid tool call from upstream",
+                # The prepared plan is bound to the original request; the
+                # extended one must be planned afresh.
+                prepared_plan = None
+                first_turn = False
+
+                if web_search_session.exhausted:
+                    # Stop advertising the tool so the model answers with what
+                    # it has instead of looping against an exhausted budget.
+                    request = replace(
+                        request,
+                        tools=_without_tool(request.tools, WEB_SEARCH_TOOL_NAME),
+                    )
+                    local_tool_names = set()
+                continue
+
+            terminal_outcome = unexpected_eof_outcome()
+            yield _sse_error_event(
+                ProviderError(
+                    terminal_outcome.error.code,
+                    status_code=502,
+                    kind=ProviderFailureKind.UPSTREAM_PROTOCOL,
                 )
-                return
+            )
+            pipeline.finish(
+                wire_status=200,
+                outcome=terminal_outcome,
+                body_summary=terminal_outcome.error.message,
+            )
+            return
 
-            for event in events:
-                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
-
-            if chunk_outcome is not None:
-                pipeline.finish(wire_status=200, outcome=chunk_outcome)
-                return
-
-        terminal_outcome = unexpected_eof_outcome()
+        # Turn cap reached without a terminal outcome. Unreachable in practice --
+        # the tool is withdrawn once the search budget is spent, so the model gets
+        # a tool-free turn well before this -- but falling out of the loop would
+        # truncate the SSE stream with no message_stop, so terminate explicitly.
+        terminal_outcome = exception_outcome(
+            "web_search loop did not converge",
+            code="server_error",
+        )
+        logger.error("web_search loop exceeded its turn cap without terminating")
         yield _sse_error_event(
             ProviderError(
-                terminal_outcome.error.code,
-                status_code=502,
-                kind=ProviderFailureKind.UPSTREAM_PROTOCOL,
+                "Internal server error",
+                status_code=500,
+                kind=ProviderFailureKind.UNKNOWN,
             )
         )
         pipeline.finish(
             wire_status=200,
             outcome=terminal_outcome,
-            body_summary=terminal_outcome.error.message,
+            body_summary="web_search loop did not converge",
         )
+        return
 
     except ProviderError as e:
         terminal_outcome = exception_outcome(str(e), code="provider_error")

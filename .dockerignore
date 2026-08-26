@@ -1,0 +1,45 @@
+# Build context excludes. The Dockerfile only needs pyproject.toml, README.md
+# and src/ (see Dockerfile:22-23), so everything else is noise — and keeping
+# secrets-bearing files out of the context is a hard requirement.
+
+# Secrets / local environment
+.env
+.env.*
+*.pem
+*.key
+auth.json
+
+# VCS and agent/tooling scratch
+.git/
+.gitignore
+.github/
+.mimocode/
+.claude/
+.codex/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+.venv/
+venv/
+
+# Not needed at runtime
+tests/
+integration_tests/
+docs/
+deploy/
+docker-compose*.yml
+Dockerfile
+Makefile
+AGENTS.md
+CHANGELOG.md
+*.log
+
+# OS noise
+.DS_Store

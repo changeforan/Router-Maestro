@@ -17,6 +17,7 @@ from router_maestro.config.priorities import (
     ModelOverride,
     PrioritiesConfig,
     ThinkingBudgetConfig,
+    WebSearchConfig,
 )
 from router_maestro.config.providers import (
     CustomProviderConfig,
@@ -62,6 +63,7 @@ __all__ = [
     "FallbackStrategy",
     "ModelOverride",
     "ThinkingBudgetConfig",
+    "WebSearchConfig",
     "RuntimeConfigConflictError",
     "RuntimeConfigRepository",
     "RuntimeConfigSnapshot",

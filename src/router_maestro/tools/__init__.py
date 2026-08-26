@@ -1,0 +1,41 @@
+"""Router-Maestro-local tools executed server-side on behalf of models."""
+
+from router_maestro.tools.web_search import (
+    WEB_SEARCH_TOOL_NAME,
+    GitHubMCPBackend,
+    GoogleSearchBackend,
+    SearchBackend,
+    SearchCitation,
+    SearchOutcome,
+    SearchResult,
+    WebSearchError,
+    build_backend,
+    format_results,
+    is_active,
+    is_server_web_search_tool,
+    local_tool_definition,
+    parse_query,
+    resolve_github_token,
+    resolve_google_credentials,
+    run_search,
+)
+
+__all__ = [
+    "WEB_SEARCH_TOOL_NAME",
+    "GitHubMCPBackend",
+    "GoogleSearchBackend",
+    "SearchBackend",
+    "SearchCitation",
+    "SearchOutcome",
+    "SearchResult",
+    "WebSearchError",
+    "build_backend",
+    "format_results",
+    "is_active",
+    "is_server_web_search_tool",
+    "local_tool_definition",
+    "parse_query",
+    "resolve_github_token",
+    "resolve_google_credentials",
+    "run_search",
+]

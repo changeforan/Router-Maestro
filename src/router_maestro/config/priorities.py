@@ -1,6 +1,7 @@
 """Model priority configuration."""
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -89,6 +90,68 @@ class AuditConfig(BaseModel):
     )
 
 
+class WebSearchConfig(BaseModel):
+    """Router-Maestro-local ``web_search`` tool configuration.
+
+    When enabled, Router-Maestro executes web searches server-side on behalf of
+    models whose upstream cannot run Anthropic's hosted ``web_search`` server
+    tool (notably Claude via GitHub Copilot).
+
+    The default ``github_mcp`` backend calls the same Bing-backed ``web_search``
+    tool the GitHub Copilot CLI uses, reusing the stored GitHub Copilot OAuth
+    credential — no extra API key or quota. The ``google`` backend needs its own
+    credentials; only environment variable *names* are stored here, never the
+    values themselves.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable the Router-Maestro-local web_search tool",
+    )
+    backend: Literal["github_mcp", "google"] = Field(
+        default="github_mcp",
+        description=(
+            "Search backend: 'github_mcp' reuses the GitHub Copilot credential; "
+            "'google' uses the Custom Search JSON API"
+        ),
+    )
+    api_key_env: str = Field(
+        default="GOOGLE_SEARCH_API_KEY",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="Environment variable supplying the google backend API key",
+    )
+    cse_id_env: str = Field(
+        default="GOOGLE_SEARCH_CSE_ID",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="Environment variable supplying the Google Programmable Search engine ID",
+    )
+    max_uses: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Maximum web_search invocations executed per client request",
+    )
+    max_results: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum results returned per search (google backend)",
+    )
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=120,
+        description="Timeout for a single upstream search API call",
+    )
+    emit_native_blocks: bool = Field(
+        default=True,
+        description=(
+            "Emit Anthropic-native server_tool_use and web_search_tool_result blocks "
+            "so clients can render sources. Disable for a text-only response."
+        ),
+    )
+
+
 class PrioritiesConfig(BaseModel):
     """Configuration for model priorities and fallback."""
 
@@ -108,6 +171,7 @@ class PrioritiesConfig(BaseModel):
         description="anthropic-beta tokens to strip (supports trailing * wildcard)",
     )
     audit: AuditConfig = Field(default_factory=AuditConfig)
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
 
     @classmethod
     def get_default(cls) -> PrioritiesConfig:

@@ -68,6 +68,7 @@ def test_admin_get_returns_complete_config_revision_and_etag(tmp_path):
         "guards",
         "beta_strip",
         "audit",
+        "web_search",
         "revision",
     }
     assert body["model_overrides"]["gpt-5"]["max_output_tokens"] == 8192

@@ -324,6 +324,9 @@ class AnthropicUsage(BaseModel):
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
     service_tier: Literal["standard", "priority", "batch"] | None = None
+    # Server-side tool counters, e.g. {"web_search_requests": 2}. Present only
+    # when Router-Maestro executed a server tool for this request.
+    server_tool_use: dict[str, Any] | None = None
 
 
 class AnthropicMessagesResponse(BaseModel):
@@ -437,6 +440,7 @@ class AnthropicStreamState(BaseModel):
     last_usage: dict | None = None  # Track the latest usage from stream chunks
     message_complete: bool = False  # Track if message_stop was sent
     # Accumulated token counts (providers send cumulative totals, not deltas)
+    server_tool_requests: int = 0  # local server-tool executions replayed downstream
     accumulated_completion_tokens: int = 0
     accumulated_prompt_tokens: int = 0
     completion_tokens_details: dict | None = None  # reasoning_tokens, etc.

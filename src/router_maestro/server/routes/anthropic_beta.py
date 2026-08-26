@@ -48,6 +48,8 @@ from router_maestro.server.routes.anthropic import (
     messages as standard_messages,
 )
 from router_maestro.server.streaming import parse_sse_frame, sse_streaming_response
+from router_maestro.server.web_search_runtime import is_local_web_search_active
+from router_maestro.tools.web_search import is_server_web_search_tool
 from router_maestro.utils import get_logger
 from router_maestro.utils.async_iterators import close_async_iterator
 from router_maestro.utils.reasoning import VALID_EFFORTS
@@ -119,6 +121,21 @@ def _raise_for_native_status(response, candidate: RouteCandidate) -> None:
             provider=candidate.model.provider,
             model=candidate.model.upstream_id,
         )
+
+
+def _wants_local_web_search(body: dict) -> bool:
+    """True when this request declares a hosted web_search tool we serve locally.
+
+    Copilot's native endpoint rejects Anthropic's hosted ``web_search`` server
+    tool outright, so when the local implementation is configured we hand the
+    request to the standard translated route, which runs the search loop.
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return False
+    if not any(is_server_web_search_tool(tool) for tool in tools):
+        return False
+    return is_local_web_search_active()
 
 
 def _is_native_eligible(provider_name: str, actual_model: str) -> bool:
@@ -1078,7 +1095,17 @@ async def beta_messages(raw_request: FastAPIRequest):
     if validation_error is not None:
         return validation_error
 
-    if copilot_provider is None or operation_support is CapabilitySupport.UNSUPPORTED:
+    # Anthropic's hosted web_search server tool cannot run on Copilot's native
+    # endpoint (it 400s: "The use of the web search tool is not supported.").
+    # When Router-Maestro is configured to serve web_search locally, route the
+    # request through the standard translated path, which owns that tool loop.
+    serve_web_search_locally = _wants_local_web_search(body)
+
+    if (
+        copilot_provider is None
+        or operation_support is CapabilitySupport.UNSUPPORTED
+        or serve_web_search_locally
+    ):
         feature_error = _validate_explicit_requested_features(native_resolution.plan)
         if feature_error is not None:
             return feature_error
