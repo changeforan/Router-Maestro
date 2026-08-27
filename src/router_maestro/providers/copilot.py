@@ -446,6 +446,19 @@ class CopilotOutboundContract(OutboundContract):
             )
         return ReasoningResolution(effort=upstream_effort)
 
+    # Tool types dropped before reaching Copilot's Responses API.
+    #
+    # ``web_search`` / ``web_search_preview`` are a known gap rather than an
+    # upstream limitation: /responses *does* execute them server-side (verified
+    # by direct probing — HTTP 200 with ``web_search_call`` output items and a
+    # correctly dated answer). They stay listed because the response they
+    # produce carries one reasoning item per search round, and the Responses
+    # codec models only a single atomic reasoning item, so forwarding them
+    # turns a stale-but-working answer into a 502. Lifting this requires
+    # ``ResponsesResponse`` to carry ordered multi-reasoning items, each with
+    # its own upstream id and encrypted blob. See docs/web-search.md.
+    #
+    # ``code_interpreter`` has not been probed; the conservative default holds.
     _RESPONSES_UNSUPPORTED_TOOL_TYPES = frozenset(
         {"web_search", "web_search_preview", "code_interpreter"}
     )
@@ -478,10 +491,19 @@ class CopilotOutboundContract(OutboundContract):
                     )
             elif tool_type not in self._RESPONSES_UNSUPPORTED_TOOL_TYPES:
                 validated.append(_normalize_copilot_tool(tool))
-            # else: silently drop tools Copilot Responses cannot express
-            # (web_search, web_search_preview, code_interpreter). Clients like
-            # Codex inject these unconditionally; 400-ing the whole request over
-            # a tool the backend can't run is worse than dropping it.
+            else:
+                # Dropped rather than rejected: clients like Codex inject these
+                # unconditionally, and 400-ing the whole request is worse. But
+                # the drop is silent to the caller and the model then answers
+                # from stale knowledge, so record it — this is the only signal
+                # that a search the client asked for never happened.
+                logger.warning(
+                    "Dropping unsupported tool type %r for %s (model=%s); "
+                    "the model will answer without it",
+                    tool_type,
+                    operation.value if hasattr(operation, "value") else operation,
+                    model,
+                )
         return validated or None
 
     def normalize_responses_input(
@@ -1380,6 +1402,9 @@ class CopilotProvider(BaseProvider):
     # so Copilot can resolve namespaced function_calls like
     # ``kusto/execute_query``. Explicitly unsupported or malformed tools are
     # client errors; silently dropping them changes the requested semantics.
+    #
+    # See ``_RESPONSES_UNSUPPORTED_TOOL_TYPES`` for why web_search stays listed
+    # even though the upstream can run it.
     UNSUPPORTED_TOOL_TYPES = {
         "web_search",
         "web_search_preview",
