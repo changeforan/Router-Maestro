@@ -13,19 +13,12 @@ search itself:
 
 The loop runs entirely server-side; the client never sees the tool traffic.
 
-Two backends are available:
-
-``github_mcp`` (default)
-    Calls the ``web_search`` tool on GitHub's remote MCP server
-    (``https://api.githubcopilot.com/mcp/``) — the same Bing-backed tool the
-    GitHub Copilot CLI uses. It reuses the GitHub Copilot OAuth credential that
-    Router-Maestro already stores, so it needs no extra API key and no extra
-    quota. Note the tool lives outside the server's default toolset, so the
-    ``X-MCP-Toolsets: all`` header is required.
-
-``google``
-    Google Programmable Search (Custom Search JSON API). Requires an API key
-    and a search engine ID supplied through environment variables.
+Searches run against the ``web_search`` tool on GitHub's remote MCP server
+(``https://api.githubcopilot.com/mcp/``) — the same Bing-backed tool the GitHub
+Copilot CLI uses. It reuses the GitHub Copilot OAuth credential Router-Maestro
+already stores, so it needs no extra API key and no extra quota. Note the tool
+lives outside the server's default toolset, so the ``X-MCP-Toolsets: all``
+header is required.
 
 Credentials are never logged, persisted here, or echoed to clients.
 """
@@ -34,7 +27,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -48,8 +40,6 @@ logger = logging.getLogger(__name__)
 # as {"type": "web_search_20250305", "name": "web_search"}; we keep the same
 # name so prompts and system reminders referencing it stay coherent.
 WEB_SEARCH_TOOL_NAME = "web_search"
-
-GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 
 GITHUB_MCP_ENDPOINT = "https://api.githubcopilot.com/mcp/"
 MCP_PROTOCOL_VERSION = "2025-06-18"
@@ -119,15 +109,6 @@ class SearchBackend(Protocol):
     async def search(self, query: str) -> SearchOutcome: ...
 
 
-@dataclass(frozen=True)
-class SearchResult:
-    """One search hit (Google backend)."""
-
-    title: str
-    url: str
-    snippet: str
-
-
 def is_server_web_search_tool(tool: Any) -> bool:
     """Return True if ``tool`` declares Anthropic's hosted web_search server tool.
 
@@ -161,24 +142,6 @@ def local_tool_definition() -> dict[str, Any]:
 # --- credential resolution -------------------------------------------------
 
 
-def resolve_google_credentials(
-    config: WebSearchConfig,
-    *,
-    environ: dict[str, str] | None = None,
-) -> tuple[str, str] | None:
-    """Resolve (api_key, cse_id) for the Google backend from the environment.
-
-    Returns ``None`` when either is absent so the feature degrades to disabled
-    instead of raising. Never logs the values.
-    """
-    environment = os.environ if environ is None else environ
-    api_key = environment.get(config.api_key_env)
-    cse_id = environment.get(config.cse_id_env)
-    if not api_key or not cse_id:
-        return None
-    return api_key, cse_id
-
-
 def resolve_github_token(*, credential_repository: Any | None = None) -> str | None:
     """Read the GitHub OAuth token from the stored Copilot credential.
 
@@ -205,26 +168,15 @@ def resolve_github_token(*, credential_repository: Any | None = None) -> str | N
 def is_active(
     config: WebSearchConfig,
     *,
-    environ: dict[str, str] | None = None,
     credential_repository: Any | None = None,
 ) -> bool:
     """Return True when the local web_search tool is enabled and usable."""
     if not config.enabled:
         return False
-    if config.backend == "google":
-        if resolve_google_credentials(config, environ=environ) is None:
-            logger.warning(
-                "web_search backend 'google' is enabled but credentials are missing; "
-                "expected environment variables %s and %s",
-                config.api_key_env,
-                config.cse_id_env,
-            )
-            return False
-        return True
     if resolve_github_token(credential_repository=credential_repository) is None:
         logger.warning(
-            "web_search backend 'github_mcp' is enabled but no GitHub Copilot "
-            "credential is available; run 'router-maestro auth login github-copilot'"
+            "web_search is enabled but no GitHub Copilot credential is available; "
+            "run 'router-maestro auth login github-copilot'"
         )
         return False
     return True
@@ -233,17 +185,9 @@ def is_active(
 def build_backend(
     config: WebSearchConfig,
     *,
-    environ: dict[str, str] | None = None,
     credential_repository: Any | None = None,
 ) -> SearchBackend | None:
-    """Construct the configured backend, or None when unusable."""
-    if config.backend == "google":
-        credentials = resolve_google_credentials(config, environ=environ)
-        if credentials is None:
-            return None
-        api_key, cse_id = credentials
-        return GoogleSearchBackend(config, api_key=api_key, cse_id=cse_id)
-
+    """Construct the search backend, or None when no credential is available."""
     token = resolve_github_token(credential_repository=credential_repository)
     if token is None:
         return None
@@ -438,89 +382,6 @@ def _unwrap_output_text(raw: str) -> tuple[str, list[SearchCitation]]:
             label = title if isinstance(title, str) and title else ""
             citations.append(SearchCitation(title=label, url=url))
     return value, citations
-
-
-# --- Google backend --------------------------------------------------------
-
-
-class GoogleSearchBackend:
-    """Google Programmable Search (Custom Search JSON API) backend."""
-
-    def __init__(self, config: WebSearchConfig, *, api_key: str, cse_id: str) -> None:
-        self._config = config
-        self._api_key = api_key
-        self._cse_id = cse_id
-
-    async def search(self, query: str) -> SearchOutcome:
-        """Run one search, returning model text plus structured sources."""
-        results = await self.search_results(query)
-        return SearchOutcome(
-            format_results(results),
-            [SearchCitation(title=r.title, url=r.url) for r in results if r.url],
-        )
-
-    async def search_results(self, query: str) -> list[SearchResult]:
-        """Run one search. Raises WebSearchError with a client-safe message."""
-        params = {
-            "key": self._api_key,
-            "cx": self._cse_id,
-            "q": query,
-            "num": self._config.max_results,
-            "safe": "off",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=self._config.timeout_seconds) as client:
-                response = await client.get(GOOGLE_ENDPOINT, params=params)
-        except httpx.TimeoutException as exc:
-            raise WebSearchError("Web search timed out.") from exc
-        except httpx.HTTPError as exc:
-            # Do not interpolate the exception: httpx repr can include the full
-            # request URL, which carries the API key in the query string.
-            raise WebSearchError("Web search transport error.") from exc
-
-        if response.status_code != 200:
-            # Google echoes the reason in the body; surface only the status so
-            # no credential material can leak through an error path.
-            logger.warning("Web search backend returned status %s", response.status_code)
-            raise WebSearchError(f"Web search failed with status {response.status_code}.")
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise WebSearchError("Web search returned a malformed response.") from exc
-
-        return _parse_google_items(payload, limit=self._config.max_results)
-
-
-def _parse_google_items(payload: Any, *, limit: int) -> list[SearchResult]:
-    """Extract results from a Custom Search JSON payload."""
-    if not isinstance(payload, dict):
-        return []
-    items = payload.get("items")
-    if not isinstance(items, list):
-        return []
-    results: list[SearchResult] = []
-    for item in items[:limit]:
-        if not isinstance(item, dict):
-            continue
-        results.append(
-            SearchResult(
-                title=str(item.get("title") or "").strip(),
-                url=str(item.get("link") or "").strip(),
-                snippet=str(item.get("snippet") or "").strip(),
-            )
-        )
-    return results
-
-
-def format_results(results: list[SearchResult]) -> str:
-    """Render results as the tool_result text handed back to the model."""
-    if not results:
-        return "No results found."
-    lines = []
-    for index, result in enumerate(results, start=1):
-        lines.append(f"[{index}] {result.title}\nURL: {result.url}\n{result.snippet}")
-    return "\n\n".join(lines)
 
 
 # --- shared execution ------------------------------------------------------

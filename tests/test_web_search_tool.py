@@ -21,34 +21,22 @@ from router_maestro.server.web_search_runtime import (
 )
 from router_maestro.tools.web_search import (
     GitHubMCPBackend,
-    GoogleSearchBackend,
     SearchCitation,
     SearchOutcome,
-    SearchResult,
     WebSearchError,
     build_backend,
-    format_results,
     is_active,
     is_server_web_search_tool,
     local_tool_definition,
     parse_query,
     resolve_github_token,
-    resolve_google_credentials,
-    run_search,
 )
 
 HOSTED_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
 
 
 def _config(**overrides) -> WebSearchConfig:
-    """Google-backend config (the github_mcp backend is covered separately)."""
-    return WebSearchConfig(**{"enabled": True, "backend": "google", **overrides})
-
-
-def _environ(**overrides) -> dict[str, str]:
-    base = {"GOOGLE_SEARCH_API_KEY": "test-key", "GOOGLE_SEARCH_CSE_ID": "test-cse"}
-    base.update(overrides)
-    return base
+    return WebSearchConfig(**{"enabled": True, **overrides})
 
 
 # --- tool detection --------------------------------------------------------
@@ -84,35 +72,6 @@ def test_local_tool_definition_declares_a_query_schema() -> None:
 # --- credentials and activation -------------------------------------------
 
 
-def test_resolve_credentials_reads_configured_env_names() -> None:
-    resolved = resolve_google_credentials(_config(), environ=_environ())
-    assert resolved == ("test-key", "test-cse")
-
-
-def test_resolve_credentials_honors_custom_env_names() -> None:
-    config = _config(api_key_env="MY_KEY", cse_id_env="MY_CSE")
-    resolved = resolve_google_credentials(config, environ={"MY_KEY": "k", "MY_CSE": "c"})
-    assert resolved == ("k", "c")
-
-
-def test_missing_credentials_disable_the_feature() -> None:
-    assert resolve_google_credentials(_config(), environ={}) is None
-    assert is_active(_config(), environ={}) is False
-    assert build_backend(_config(), environ={}) is None
-
-
-def test_disabled_config_is_inactive_even_with_credentials() -> None:
-    assert is_active(_config(enabled=False), environ=_environ()) is False
-
-
-def test_missing_credentials_do_not_log_secret_values(caplog) -> None:
-    """A misconfiguration warning must name env vars, never values."""
-    with caplog.at_level("WARNING"):
-        is_active(_config(), environ={"GOOGLE_SEARCH_API_KEY": "super-secret-value"})
-    assert "GOOGLE_SEARCH_API_KEY" in caplog.text
-    assert "super-secret-value" not in caplog.text
-
-
 # --- argument parsing ------------------------------------------------------
 
 
@@ -127,101 +86,6 @@ def test_parse_query_extracts_the_query() -> None:
 def test_parse_query_rejects_unusable_arguments(arguments) -> None:
     with pytest.raises(WebSearchError):
         parse_query(arguments)
-
-
-# --- Google backend --------------------------------------------------------
-
-
-def _backend(handler, **config_overrides) -> GoogleSearchBackend:
-    backend = build_backend(_config(**config_overrides), environ=_environ())
-    assert backend is not None
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    patcher = patch("router_maestro.tools.web_search.httpx.AsyncClient", return_value=client)
-    patcher.start()
-    return backend
-
-
-async def test_google_backend_parses_results() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["q"] == "python release"
-        assert request.url.params["cx"] == "test-cse"
-        return httpx.Response(
-            200,
-            json={
-                "items": [
-                    {"title": "Python", "link": "https://python.org", "snippet": "3.14.3"},
-                    {"title": "Docs", "link": "https://docs.python.org", "snippet": "notes"},
-                ]
-            },
-        )
-
-    backend = _backend(handler)
-    try:
-        results = await backend.search_results("python release")
-    finally:
-        patch.stopall()
-
-    assert results == [
-        SearchResult("Python", "https://python.org", "3.14.3"),
-        SearchResult("Docs", "https://docs.python.org", "notes"),
-    ]
-
-
-async def test_google_backend_respects_max_results() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["num"] == "2"
-        return httpx.Response(200, json={"items": [{"title": str(i)} for i in range(5)]})
-
-    backend = _backend(handler, max_results=2)
-    try:
-        results = await backend.search_results("q")
-    finally:
-        patch.stopall()
-    assert len(results) == 2
-
-
-async def test_google_backend_error_status_raises_without_leaking_key() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": {"message": "key test-key is invalid"}})
-
-    backend = _backend(handler)
-    try:
-        with pytest.raises(WebSearchError) as excinfo:
-            await backend.search_results("q")
-    finally:
-        patch.stopall()
-    assert "test-key" not in str(excinfo.value)
-    assert "403" in str(excinfo.value)
-
-
-async def test_run_search_converts_errors_into_model_readable_text() -> None:
-    """A failing search must not fail the whole client request."""
-
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
-
-    backend = _backend(handler)
-    try:
-        outcome = await run_search(backend, '{"query": "q"}')
-    finally:
-        patch.stopall()
-    assert outcome.text.startswith("Search error:")
-
-
-async def test_run_search_reports_bad_arguments_to_the_model() -> None:
-    backend = build_backend(_config(), environ=_environ())
-    assert backend is not None
-    outcome = await run_search(backend, "not json")
-    assert outcome.text.startswith("Search error:")
-
-
-def test_format_results_renders_titles_urls_and_snippets() -> None:
-    rendered = format_results([SearchResult("T", "https://u", "S")])
-    assert "T" in rendered and "https://u" in rendered and "S" in rendered
-
-
-def test_format_results_handles_no_hits() -> None:
-    assert format_results([]) == "No results found."
 
 
 # --- request preparation ---------------------------------------------------
@@ -247,7 +111,10 @@ def test_prepare_swaps_hosted_tool_for_a_local_function_tool() -> None:
             "router_maestro.config.load_priorities_config",
             return_value=_enabled_priorities(),
         ),
-        patch("router_maestro.tools.web_search.os.environ", _environ()),
+        patch(
+            "router_maestro.tools.web_search.resolve_github_token",
+            return_value="ghu_token",
+        ),
     ):
         session = prepare_web_search(request)
 
@@ -385,11 +252,7 @@ def test_merge_usage_handles_missing_sides() -> None:
     assert merge_usage({"prompt_tokens": 1}, None) == {"prompt_tokens": 1}
 
 
-# --- GitHub MCP backend ----------------------------------------------------
-
-
-def _mcp_config(**overrides) -> WebSearchConfig:
-    return WebSearchConfig(**{"enabled": True, "backend": "github_mcp", **overrides})
+# --- search backend ----------------------------------------------------
 
 
 class _StubCredentialRepository:
@@ -420,7 +283,7 @@ def _mcp_payload(value: str, annotations: list[dict] | None = None) -> dict:
 
 def _mcp_backend(handler, **config_overrides) -> GitHubMCPBackend:
     backend = build_backend(
-        _mcp_config(**config_overrides),
+        _config(**config_overrides),
         credential_repository=_StubCredentialRepository(_OAuthCredential()),
     )
     assert isinstance(backend, GitHubMCPBackend)
@@ -435,21 +298,21 @@ def test_github_token_comes_from_the_stored_copilot_credential() -> None:
     assert resolve_github_token(credential_repository=repository) == "ghu_token"
 
 
-def test_missing_copilot_credential_disables_the_mcp_backend() -> None:
+def test_missing_copilot_credential_disables_the_backend() -> None:
     repository = _StubCredentialRepository(None)
     assert resolve_github_token(credential_repository=repository) is None
-    assert is_active(_mcp_config(), credential_repository=repository) is False
-    assert build_backend(_mcp_config(), credential_repository=repository) is None
+    assert is_active(_config(), credential_repository=repository) is False
+    assert build_backend(_config(), credential_repository=repository) is None
 
 
-def test_mcp_backend_is_active_without_any_env_vars() -> None:
-    """The github_mcp backend needs no extra secret beyond the Copilot login."""
+def test_backend_is_active_without_any_env_vars() -> None:
+    """The backend needs no extra secret beyond the Copilot login."""
     repository = _StubCredentialRepository(_OAuthCredential())
-    assert is_active(_mcp_config(), environ={}, credential_repository=repository) is True
+    assert is_active(_config(), credential_repository=repository) is True
 
 
-def test_mcp_backend_is_the_default() -> None:
-    assert WebSearchConfig().backend == "github_mcp"
+def test_feature_is_disabled_by_default() -> None:
+    assert WebSearchConfig().enabled is False
 
 
 async def test_mcp_backend_returns_answer_with_sources() -> None:

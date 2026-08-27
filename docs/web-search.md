@@ -61,9 +61,7 @@ Clients that echo them back are safe: the inbound schema accepts them (the block
 union permits raw dicts) and the OpenAI translation drops them, since the
 upstream history is rebuilt by the search loop itself.
 
-## Backends
-
-### `github_mcp` (default)
+## Search backend
 
 Calls the `web_search` tool on GitHub's remote MCP server
 (`https://api.githubcopilot.com/mcp/`) — the same Bing-backed tool Copilot CLI
@@ -76,16 +74,6 @@ uses. It returns an AI-synthesised answer with citation URLs.
   `X-MCP-Toolsets: all` header the server advertises 47 GitHub-only tools and
   `web_search` is absent. Router-Maestro sends that header automatically.
 
-### `google`
-
-Google Programmable Search (Custom Search JSON API). Returns ranked
-title/URL/snippet results.
-
-- **Credentials:** an API key and a Programmable Search engine ID, supplied via
-  environment variables. Only the *names* of those variables are stored in
-  config — never the values.
-- Free tier is 100 queries/day.
-
 ## Configuration
 
 The feature is **disabled by default** and lives in `priorities.json` under
@@ -95,7 +83,6 @@ The feature is **disabled by default** and lives in `priorities.json` under
 {
   "web_search": {
     "enabled": true,
-    "backend": "github_mcp",
     "max_uses": 5,
     "timeout_seconds": 60.0
   }
@@ -105,24 +92,17 @@ The feature is **disabled by default** and lives in `priorities.json` under
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Master switch |
-| `backend` | `"github_mcp"` | `github_mcp` or `google` |
 | `max_uses` | `5` | Max searches executed per client request |
-| `max_results` | `5` | Results per search (`google` only) |
 | `timeout_seconds` | `60.0` | Timeout for one upstream search call |
 | `emit_native_blocks` | `true` | Emit `server_tool_use` / `web_search_tool_result` blocks |
-| `api_key_env` | `GOOGLE_SEARCH_API_KEY` | Env var holding the `google` API key |
-| `cse_id_env` | `GOOGLE_SEARCH_CSE_ID` | Env var holding the `google` engine ID |
 
 Enable it through the admin API (no restart needed):
 
 ```bash
 curl -sS -X PATCH "$URL/api/admin/priorities" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"web_search": {"enabled": true, "backend": "github_mcp"}}'
+  -d '{"web_search": {"enabled": true}}'
 ```
-
-For the `google` backend, also set the two environment variables on the server
-process, then switch `backend` to `"google"`.
 
 ## Behaviour
 
@@ -143,12 +123,10 @@ process, then switch `backend` to `"google"`.
 
 ## Security
 
-- Credentials are read from the existing credential store or from environment
-  variables; they are never written to `priorities.json`, logged, or returned
-  to clients.
-- Search backends surface only HTTP status codes on failure — response bodies
-  (which can echo an API key supplied in a query string) are not interpolated
-  into error messages.
+- The GitHub credential is read from the existing credential store; it is never
+  written to `priorities.json`, logged, or returned to clients.
+- Failures surface only HTTP status codes — upstream response bodies are not
+  interpolated into error messages.
 - Logs record the query *length*, never the query text or credential material.
 - Search results are untrusted third-party content. They are inserted as a
   `tool_result`, the same trust level as any other tool output, and are subject
@@ -156,9 +134,9 @@ process, then switch `backend` to `"google"`.
 
 ## Limitations
 
-- `github_mcp` depends on an undocumented, non-default MCP toolset; GitHub could
+- The tool depends on an undocumented, non-default MCP toolset; GitHub could
   change or withdraw it.
-- Each `github_mcp` search opens a short-lived MCP session (initialize →
+- Each search opens a short-lived MCP session (initialize →
   initialized → tools/call), i.e. three HTTP round trips. This keeps the server
   stateless and scale-to-zero friendly at the cost of a little latency.
 - The loop is implemented for the Anthropic Messages surface only. OpenAI and

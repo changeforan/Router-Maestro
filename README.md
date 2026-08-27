@@ -62,9 +62,9 @@ Router-Maestro acts as a proxy that gives you access to models from multiple pro
   client, not an API capability. When enabled, Router-Maestro plays that client
   role itself: it advertises `web_search` as a function tool, intercepts the
   model's `tool_use`, runs the search, feeds the result back, and returns only
-  the final answer. The default backend reuses the stored GitHub Copilot
-  credential (no extra API key); a Google Programmable Search backend is also
-  available. Disabled by default — see [docs/web-search.md](docs/web-search.md).
+  the final answer. Searches reuse the stored GitHub Copilot credential, so no
+  extra API key or quota is needed. Disabled by default — see
+  [docs/web-search.md](docs/web-search.md).
 
 ## Table of Contents
 

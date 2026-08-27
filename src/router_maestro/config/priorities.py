@@ -1,7 +1,6 @@
 """Model priority configuration."""
 
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -97,45 +96,20 @@ class WebSearchConfig(BaseModel):
     models whose upstream cannot run Anthropic's hosted ``web_search`` server
     tool (notably Claude via GitHub Copilot).
 
-    The default ``github_mcp`` backend calls the same Bing-backed ``web_search``
-    tool the GitHub Copilot CLI uses, reusing the stored GitHub Copilot OAuth
-    credential — no extra API key or quota. The ``google`` backend needs its own
-    credentials; only environment variable *names* are stored here, never the
-    values themselves.
+    Searches run against the same Bing-backed ``web_search`` tool the GitHub
+    Copilot CLI uses, reusing the stored GitHub Copilot OAuth credential — no
+    extra API key or quota, and no credential material stored here.
     """
 
     enabled: bool = Field(
         default=False,
         description="Enable the Router-Maestro-local web_search tool",
     )
-    backend: Literal["github_mcp", "google"] = Field(
-        default="github_mcp",
-        description=(
-            "Search backend: 'github_mcp' reuses the GitHub Copilot credential; "
-            "'google' uses the Custom Search JSON API"
-        ),
-    )
-    api_key_env: str = Field(
-        default="GOOGLE_SEARCH_API_KEY",
-        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
-        description="Environment variable supplying the google backend API key",
-    )
-    cse_id_env: str = Field(
-        default="GOOGLE_SEARCH_CSE_ID",
-        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
-        description="Environment variable supplying the Google Programmable Search engine ID",
-    )
     max_uses: int = Field(
         default=5,
         ge=1,
         le=20,
         description="Maximum web_search invocations executed per client request",
-    )
-    max_results: int = Field(
-        default=5,
-        ge=1,
-        le=10,
-        description="Maximum results returned per search (google backend)",
     )
     timeout_seconds: float = Field(
         default=60.0,

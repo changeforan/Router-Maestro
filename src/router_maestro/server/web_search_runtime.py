@@ -127,8 +127,7 @@ def prepare_web_search(request: AnthropicMessagesRequest) -> WebSearchSession | 
     request.tools = replacement
 
     logger.info(
-        "Intercepting hosted web_search tool; serving it locally (backend=%s, max_uses=%d)",
-        config.backend,
+        "Intercepting hosted web_search tool; serving it locally (max_uses=%d)",
         config.max_uses,
     )
     return WebSearchSession(
